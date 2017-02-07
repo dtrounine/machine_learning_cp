@@ -1,0 +1,195 @@
+---
+title: "Exercise Quality Prediction"
+author: "Dmitry Trunin"
+date: '6 февраля 2017 г '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(caret)
+library(ggplot2)
+library(randomForest)
+library(corrplot)
+```
+
+## Overview
+
+The goal of this course project is to explore the Weight Lifting Exercise Dataset which is available from the website here: http://groupware.les.inf.puc-rio.br/har, and build a model for predicting *classe* variable which corresponds to the quality of exercising a weight lifting activity. Such a model could be practically used for recognition of user's activity and providing feedback about quality of exercising. 
+
+In this course project the model will be used for predicting *classe* variable in 20 different test cases for grading purpose. This imposes requirements on the model accuracy which must be hight enough for predicting correctly at least 80% of test cases (passing grade). If we want to be 80% sure about predicting correctly all test cases, the minimum required model accuracy would be:
+
+0.8^1/20^ = `r 0.8^(1/20)`
+
+## Obtaining and cleaning data
+
+The data that can be used for building a model is available here: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+```{r echo=FALSE}
+data <- read.csv("pml-training.csv", na.strings = c("NA", ""))
+invalidRowRatio = mean(data$new_window == "yes") * 100
+```
+
+We first load data from this file and remove all rows with *new_window = "yes"*, because these rows contain malformed values (e.g. "#DIV/0!"). There are only `r round(invalidRowRatio, digits=2)`% of such rows and we hope that removing them won't affect much the accuracy.
+
+```{r echo=TRUE}
+  # Read original data
+  data <- read.csv("pml-training.csv", na.strings = c("NA", ""))
+  
+  # Filter out rows with new_window = "yes" (they contain garbage)
+  data <- data[data$new_window == "no",]
+```
+
+We save filtered data to temp file and re-read it again, this time parsing all 152 predictor columns into numeric format:
+
+```{r echo = TRUE}
+  tmpFile <- tempfile("tmp_data_", tmpdir = getwd(), fileext = ".csv")
+  write.csv(data, file = tmpFile, row.names = FALSE)
+  
+  # Re-read filtered data from temp file
+  data <- read.csv(tmpFile,
+                   colClasses = c(
+                       "integer",   # X
+                       "factor",    # user_name
+                       "integer",   # raw_timestamp_part_1
+                       "integer",   # raw_timestamp_part_2
+                       "character", # cvtd_timestamp
+                       "factor",    # new_window
+                       "integer",   # num_window
+                       rep("numeric", 152),  # all 152 predictors are numeric
+                       "factor"     # classe
+                   ),
+                   na.strings = c("NA"))
+  
+  # Delete temp file
+  unlink(tmpFile)  
+```
+
+Then we remove some columns which contain technical information about how and when the data were recorded and are not relevant to the nature of problem. These columns are: *X*, *raw_timestamp_part_1*, *raw_timestamp_part_2*, *cvtd_timestamp*, *new_window* and *num_window*:
+
+```{r echo=TRUE}
+    data$X <- NULL
+    data$raw_timestamp_part_1 <- NULL
+    data$raw_timestamp_part_2 <- NULL
+    data$cvtd_timestamp <- NULL
+    data$new_window <- NULL
+    data$num_window <- NULL
+```
+
+Finally we notice that many columns contain no data at all (all values are *NA*). We remove these columns too:
+
+```{r echo=TRUE}
+   for (col in names(data)) {
+      # Actually all column with at least one NA have NAs in all rows
+      if (sum(is.na(data[,col])) > 0) {
+          data[,col] <- NULL
+      }
+   }
+```
+
+Remaining data frame has `r ncol(data)` columns (including the *class* column which is the outcome variable):
+```{r echo=FALSE}
+names(data)
+```
+
+## Data partitioning
+
+Before we can begin with data analysis we split the cleaned data into *training* (75%) and *testing* (25%) sets for validation purposes. The training set will be used for building the model, and the testing set will be only used for validation and estimation of out-of-sample error of the final model.
+
+```{r echo=TRUE}
+set.seed(239237)
+
+inTrain <- createDataPartition(data$class, p = 3/4, list = FALSE)
+
+training <- data[inTrain,]
+testing <- data[-inTrain,]
+
+```
+
+## Selecting predictor variables
+
+We choose random forest algorithm for the model for its accuracy. However, the number of predictor variables being large we should try to eliminate some of them and use only the most important predictors for the final model. For this, we first train a simple random forest model with only 20 trees using all `r ncol(training)-1` predictors:
+
+```{r echo=TRUE}
+small_forest_model <- randomForest(classe ~ ., data = training, ntree = 20, importance = TRUE)
+```
+
+and get the information about importance of predictors from that model:
+
+```{r echo=TRUE}
+varImpPlot(small_forest_model)
+```
+
+This plot shows two sets of predictor variables orderd by their importance according to two measures. We extract the top 12 predictors variables using the following code:
+
+```{r echo=TRUE}
+    # get importance information from the model
+    importanceMatrix <- importance(small_forest_model)
+    # convert it to data frame with VarName column containing the name of variable
+    important_predictors <- as.data.frame(importanceMatrix)
+    important_predictors$VarName <- rownames(important_predictors)
+    # assign two scores to each variable according to two importance measures
+    important_predictors$Score1 <- order(order(important_predictors$MeanDecreaseAccuracy))
+    important_predictors$Score2 <- order(order(important_predictors$MeanDecreaseGini))
+    # order variables by they total score
+    ordered_predictors <- important_predictors$VarName[order(-important_predictors$Score1 - important_predictors$Score2)]
+    # and finally select top 12 predictor variables
+    selected_predictors <- ordered_predictors[seq(1, min(12, length(ordered_predictors)))]
+    
+    print(selected_predictors)
+```
+
+Let's take look at correlation matrix of selected variables on this heat map plot:
+
+```{r echo=TRUE}
+corMatrix <- cor(training[,selected_predictors])
+diag(corMatrix) <- 0
+corrplot(corMatrix)
+
+```
+
+We see that two variables are highly correlated: *yaw_belt* and *roll_belt*. However, both of them are the most important predictor variables according to the small random forest model, so we keep them in the final model. Another highly correlated pair of variables are *accel_belt_z* and *roll_belt*. We will remove *accel_belt_z* from the final model as the least important of these two.
+
+```{r echo=TRUE}
+selected_predictors <- selected_predictors[!selected_predictors %in% c("accel_belt_z")]
+```
+
+## Modeling
+
+Finally we have `r length(selected_predictors)` selected predictor variables and we can build the final large random forest model with 500 trees. We use *train* function from *caret* package which allows to specify training control parameter to use 3-fold cross validation. Choosing small number of folds allows to reduce computation time.
+
+```{r echo=TRUE}
+# train full random forest model (500 trees) using selected predictors
+model <- train(x = training[,selected_predictors], 
+               y = training$classe,
+               method = "rf",
+               trControl = trainControl(method = "cv", number = 3))
+```
+
+## Validation
+
+We validate the final model using the *testing* set (remaining 25% part of *pml-training.csv* file not used for training). The confusion matrix give an idea about the accuracy:
+
+```{r echo=TRUE}
+confusionMatrix(predict(model, testing), testing$class)
+
+```
+```{r echo=TRUE}
+accuracy <- mean(predict(model, testing) == testing$class)
+```
+
+Accuracy of the final model is `r accuracy` and out of sample error is `r 1-accuracy`. 
+
+We can calculate the probability of getting 80% or 100% correct predictions out of 20 test cases in the final quiz using this model:
+
+```{r echo=TRUE}
+p = accuracy
+p_80 <- p^20 + p^19*(1-p)*choose(20,19) + p^18*(1-p)^2*choose(20,18) + p^17*(1-p)^3*choose(20,17) + p^16*(1-p)^4*choose(20,16)
+p_100 <- p^20
+
+c(chance_80=p_80, chance_100=p_100)
+
+```
+
+
